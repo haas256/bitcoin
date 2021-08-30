@@ -252,7 +252,7 @@ If `sqlite` is not installed, then wallet functionality will be disabled.
 
 ``` bash
 ./autogen.sh
-./configure --without-wallet --with-gui=no
+./configure --without-wallet --without-bdb --with-gui=no
 ```
 
 ##### Further Configuration

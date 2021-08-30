@@ -87,15 +87,19 @@ BlockAssembler::BlockAssembler(CChainState& chainstate, const CTxMemPool& mempoo
 void BlockAssembler::resetBlock()
 {
     inBlock.clear();
+    inNextBlock.clear();
 
     // Reserve space for coinbase tx
     nBlockWeight = 4000;
     nBlockSigOpsCost = 400;
     fIncludeWitness = false;
+    nNextBlockWeight = 4000;
+    nNextBlockSigOpsCost = 400;
 
     // These counters do not include coinbase tx
     nBlockTx = 0;
     nFees = 0;
+    nFeesNext = 0;
 }
 
 std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn)
@@ -206,6 +210,15 @@ bool BlockAssembler::TestPackage(uint64_t packageSize, int64_t packageSigOpsCost
     if (nBlockWeight + WITNESS_SCALE_FACTOR * packageSize >= nBlockMaxWeight)
         return false;
     if (nBlockSigOpsCost + packageSigOpsCost >= MAX_BLOCK_SIGOPS_COST)
+        return false;
+    return true;
+}
+bool BlockAssembler::TestPackageForBS(uint64_t packageSize, int64_t packageSigOpsCost) const
+{
+    // TODO: switch to weight-based accounting for packages instead of vsize-based accounting.
+    if (nNextBlockWeight + WITNESS_SCALE_FACTOR * packageSize >= nBlockMaxWeight)
+        return false;
+    if (nNextBlockSigOpsCost + packageSigOpsCost >= MAX_BLOCK_SIGOPS_COST)
         return false;
     return true;
 }
@@ -392,8 +405,24 @@ void BlockAssembler::addPackageTxs(int &nPackagesSelected, int &nDescendantsUpda
             ++nConsecutiveFailed;
 
             if (nConsecutiveFailed > MAX_CONSECUTIVE_FAILURES && nBlockWeight >
-                    nBlockMaxWeight - 4000) {
+                    nBlockMaxWeight - 4000 && nNextBlockWeight >
+                    nBlockMaxWeight - 10000 ) {
                 // Give up if we're close to full and haven't succeeded in a while
+                assert(!nFees);
+                float gamma = nFeesNext/nFees;
+                float T = 0.63; // as an example, 30% strongest rational miner min{0.5,0.63}
+                // T needs to be in consensus file
+                CAmount nFeesCurrent = 0;
+                if (gamma < T) {
+                    nFeesCurrent = std::floor(nFees* (1+gamma) / (1+T));
+                    // iterate over transactions at the end of the current block
+                    CTxMemPool::setEntries::iterator iit = inBlock.end(); 
+                    while (nFeesCurrent < nFees) {
+                        failedTx.insert(iit);
+                        RemoveFromBlock(iit);
+                        iit--;
+                    }
+                }
                 break;
             }
             continue;
@@ -433,8 +462,54 @@ void BlockAssembler::addPackageTxs(int &nPackagesSelected, int &nDescendantsUpda
 
         // Update transactions that depend on each of these
         nDescendantsUpdated += UpdatePackagesForAdded(ancestors, mapModifiedTx);
+    } else if (!TestPackageForBS(packageSize, packageSigOpsCost)) {
+        // add the failed transaction to next bandwidth set
+        CTxMemPool::setEntries ancestors;
+        uint64_t nNoLimit = std::numeric_limits<uint64_t>::max();
+        std::string dummy;
+        m_mempool.CalculateMemPoolAncestors(*iter, ancestors, nNoLimit, nNoLimit, nNoLimit, nNoLimit, dummy, false);
+
+        onlyUnconfirmed(ancestors);
+        ancestors.insert(iter);
+
+        // Test if all tx's are Final
+        if (!TestPackageTransactions(ancestors)) {
+            if (fUsingModified) {
+                mapModifiedTx.get<ancestor_score>().erase(modit);
+                failedTx.insert(iter);
+            }
+            continue;
+        }
+        // Package can be added. Sort the entries in a valid order.
+        std::vector<CTxMemPool::txiter> sortedEntries;
+        SortForBlock(ancestors, sortedEntries);
+        for (size_t i=0; i<sortedEntries.size(); ++i) {
+            nFeesNext += sortedEntries[i]->GetFee();
+            nNextBlockWeight += sortedEntries[i]->GetTxWeight();
+            nNextBlockSigOpsCost += sortedEntries[i]->GetSigOpCost();
+        }
     }
 }
+
+void BlockAssembler::RemoveFromBlock(CTxMemPool::txiter iter)
+{
+    pblocktemplate->block.vtx.pop_back();
+    pblocktemplate->vTxFees.pop_back();
+    pblocktemplate->vTxSigOpsCost.pop_back();
+    nBlockWeight -= iter->GetTxWeight();
+    --nBlockTx;
+    nBlockSigOpsCost -= iter->GetSigOpCost();
+    nFees -= iter->GetFee();
+    inBlock.erase(iter);
+
+    bool fPrintPriority = gArgs.GetBoolArg("-printpriority", DEFAULT_PRINTPRIORITY);
+    if (fPrintPriority) {
+        LogPrintf("fee %s txid %s\n",
+                  CFeeRate(iter->GetModifiedFee(), iter->GetTxSize()).ToString(),
+                  iter->GetTx().GetHash().ToString());
+    }
+}
+
 
 void IncrementExtraNonce(CBlock* pblock, const CBlockIndex* pindexPrev, unsigned int& nExtraNonce)
 {

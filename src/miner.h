@@ -136,9 +136,11 @@ private:
 
     // Information on the current status of the block
     uint64_t nBlockWeight;
+    uint64_t nNextBlockWeight;
     uint64_t nBlockTx;
     uint64_t nBlockSigOpsCost;
-    CAmount nFees;
+    uint64_t nNextBlockSigOpsCost;
+    CAmount nFeesNext = 0;
     CTxMemPool::setEntries inBlock;
 
     // Chain context for the block
